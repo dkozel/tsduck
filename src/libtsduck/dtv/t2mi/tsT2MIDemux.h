@@ -74,7 +74,8 @@ namespace ts {
         struct PLPContext
         {
             bool      sync;  // We are synchronous on the user packets of this PLP.
-            ByteBlock up;    // Start of a user packet which continues in the next baseband frame.
+            ByteBlock up;       // Start of a user packet which continues in the next baseband frame.
+            size_t    up_bits;  // Size in bits of the partial user packet (not always byte-aligned).
 
             // Default constructor
             PLPContext();

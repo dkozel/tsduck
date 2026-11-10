@@ -31,6 +31,36 @@ namespace {
         }
         return crc;
     }
+
+    // Append 'count' bits from 'src', starting at bit 'src_bit' (MSB first), to 'dst' which holds 'dst_bits' bits.
+    // The DFL and SYNCD of a DVB-T2 BBFRAME are in bits, so user packets are not always byte-aligned in the data
+    // field (in-band signalling, collection-window allocation), see ETSI EN 302 755, section 5.1.7.
+    void AppendBits(ts::ByteBlock& dst, size_t& dst_bits, const uint8_t* src, size_t src_bit, size_t count)
+    {
+        if (count == 0) {
+            return;
+        }
+        if (dst_bits % 8 == 0 && src_bit % 8 == 0) {
+            // Fast path: both byte-aligned.
+            dst.resize(dst_bits / 8);
+            dst.append(src + src_bit / 8, (count + 7) / 8);
+            dst_bits += count;
+            dst.resize((dst_bits + 7) / 8);
+            if (dst_bits % 8 != 0) {
+                dst.back() &= uint8_t(0xFF << (8 - dst_bits % 8));
+            }
+            return;
+        }
+        dst.resize((dst_bits + count + 7) / 8, 0);
+        for (size_t i = 0; i < count; ++i) {
+            const size_t s = src_bit + i;
+            const size_t d = dst_bits + i;
+            const uint8_t bit = (src[s / 8] >> (7 - s % 8)) & 1;
+            const uint8_t mask = uint8_t(0x80 >> (d % 8));
+            dst[d / 8] = bit ? uint8_t(dst[d / 8] | mask) : uint8_t(dst[d / 8] & ~mask);
+        }
+        dst_bits += count;
+    }
 }
 
 
@@ -40,7 +70,8 @@ namespace {
 
 ts::T2MIDemux::PLPContext::PLPContext() :
     sync(false),
-    up()
+    up(),
+    up_bits(0)
 {
 }
 
@@ -185,6 +216,7 @@ void ts::T2MIDemux::PIDContext::lostSync()
 void ts::T2MIDemux::PLPContext::lostSync()
 {
     up.clear();     // partial user packet.
+    up_bits = 0;
     sync = false;
 }
 
@@ -300,54 +332,62 @@ void ts::T2MIDemux::demuxTS(PID pid, PIDContext& pc, const T2MIPacket& pkt)
         return;
     }
 
-    // Data Field Length in bytes.
-    size_t dfl = (GetUInt16(data + 4) + 7) / 8;
-
-    // Synchronization distance in bits.
+    // Data Field Length and synchronization distance, in bits (ETSI EN 302 755, section 5.1.7).
+    size_t dfl = GetUInt16(data + 4);
     size_t syncd = GetUInt16(data + 7);
+    const size_t up_bits = up_size * 8;
 
     // Now skip baseband header.
     data += T2_BBHEADER_SIZE;
     size -= T2_BBHEADER_SIZE;
 
     // Adjust invalid DFL (should not happen).
-    if (dfl > size) {
-        dfl = size;
+    if (dfl > size * 8) {
+        dfl = size * 8;
     }
 
     if (syncd == 0xFFFF) {
         // No user packet starts in data field, the current one continues.
         if (plpp->sync) {
-            plpp->up.append(data, dfl);
-            if (plpp->up.size() > up_size) {
+            AppendBits(plpp->up, plpp->up_bits, data, 0, dfl);
+            if (plpp->up_bits > up_bits) {
                 plpp->lostSync();
             }
         }
     }
     else {
-        // Synchronization distance in bytes, bounded by data field size.
-        syncd = std::min(syncd / 8, dfl);
+        // Synchronization distance bounded by data field size.
+        syncd = std::min(syncd, dfl);
 
         // Process end of previous packet. Drop it when its size is wrong (lost or inconsistent baseband frames).
         if (plpp->sync) {
-            plpp->up.append(data, syncd);
-            if (plpp->up.size() == up_size) {
+            AppendBits(plpp->up, plpp->up_bits, data, 0, syncd);
+            if (plpp->up_bits == up_bits) {
                 outputTS(pkt, plpp->up.data() + up_crc, npd ? plpp->up[up_size - 1] : 0);
             }
         }
         plpp->sync = true;
-        data += syncd;
-        dfl -= syncd;
 
-        // Process subsequent complete packets.
-        while (dfl >= up_size) {
-            outputTS(pkt, data + up_crc, npd ? data[up_size - 1] : 0);
-            data += up_size;
-            dfl -= up_size;
+        // Process subsequent complete packets, from bit 'pos' of the data field.
+        size_t pos = syncd;
+        ByteBlock shifted;
+        while (dfl - pos >= up_bits) {
+            if (pos % 8 == 0) {
+                outputTS(pkt, data + pos / 8 + up_crc, npd ? data[pos / 8 + up_size - 1] : 0);
+            }
+            else {
+                size_t n = 0;
+                shifted.clear();
+                AppendBits(shifted, n, data, pos, up_bits);
+                outputTS(pkt, shifted.data() + up_crc, npd ? shifted[up_size - 1] : 0);
+            }
+            pos += up_bits;
         }
 
         // Keep optional trailing truncated packet.
-        plpp->up.copy(data, dfl);
+        plpp->up.clear();
+        plpp->up_bits = 0;
+        AppendBits(plpp->up, plpp->up_bits, data, pos, dfl - pos);
     }
 }
 
